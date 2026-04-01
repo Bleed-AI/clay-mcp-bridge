@@ -1,0 +1,36 @@
+{
+  "name": "@bleed-ai/clay-mcp-bridge",
+  "version": "1.0.0",
+  "description": "MCP bridge that exposes Clay table operations to Claude Code via the ClayMate Chrome extension session cookie",
+  "main": "index.js",
+  "bin": {
+    "clay-mcp-bridge": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "clay",
+    "mcp",
+    "claude",
+    "claude-code",
+    "chrome-extension",
+    "claymate"
+  ],
+  "author": "Bleed-AI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Bleed-AI/clay-mcp-bridge"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
