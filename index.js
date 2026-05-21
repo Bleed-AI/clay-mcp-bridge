@@ -462,11 +462,12 @@ function getToolsList() {
     },
     {
       name: 'clay_export_table_data',
-      description: 'Export row data from a Clay table as JSON to a file. IMPORTANT: this pages through the table\'s default view (`/views/{viewId}/records`) which returns rows in the VIEW\'S native sort order — typically oldest-first. With sort="asc" + maxRows=N you get the OLDEST N rows; freshly-written rows will NOT appear unless you fetch the entire table OR use sort="desc" (which fetches count first, then pages the tail window). For write-verification (confirming a specific row landed), prefer `filterByColumnValue` which post-filters after pagination, OR sort="desc" with a maxRows ≥ the number of new rows you\'re looking for. Always writes full data to a JSON file and returns a summary with file path, sample rows, and column list.',
+      description: 'Export row data from a Clay table as JSON to a file. IMPORTANT: this pages through a view (`/views/{viewId}/records`) which returns rows in the VIEW\'S native sort order — typically oldest-first. By default uses `table.firstViewId`, which may be a FILTERED view that excludes rows visible in the Clay UI\'s main view. **For write-verification or to read everything the UI shows, pass `viewId` explicitly** — get it from the URL bar of the Clay UI (`/tables/<tableId>/views/<viewId>`) or via `clay_get_table`. With sort="asc" + maxRows=N you get the OLDEST N rows; freshly-written rows will NOT appear unless you fetch the entire table OR use sort="desc" (which fetches count first, then pages the tail window). For write-verification (confirming a specific row landed), prefer `filterByColumnValue` which post-filters after pagination, OR sort="desc" with a maxRows ≥ the number of new rows you\'re looking for. Always writes full data to a JSON file and returns a summary with file path, sample rows, and column list.',
       inputSchema: {
         type: 'object',
         properties: {
           tableId: { type: 'string', description: 'The table ID (e.g., "t_abc123")' },
+          viewId: { type: 'string', description: 'Optional view ID (e.g., "gv_xxx"). If omitted, uses table.firstViewId — which may be a filtered view that excludes rows. Pass explicitly to query a specific view (recommended: copy from Clay UI URL).' },
           maxRows: { type: 'number', description: 'Maximum number of rows to export. Default: all rows.' },
           columns: { type: 'array', items: { type: 'string' }, description: 'Only include these columns (by name). Default: all columns.' },
           sort: { type: 'string', enum: ['asc', 'desc'], description: 'Row order. "asc" (default) pages from offset=0 — view\'s native order, typically oldest-first. "desc" calls clay_count_rows first then pages the LAST maxRows window — newest-first within the view; use this when verifying recently-written rows.' },
@@ -709,7 +710,8 @@ async function handleToolCall(request) {
         if (!args?.tableId) throw new Error('tableId is required');
         result = await exportTableData(args.tableId, args.maxRows, args.columns, {
           sort: args.sort,
-          filterByColumnValue: args.filterByColumnValue
+          filterByColumnValue: args.filterByColumnValue,
+          viewId: args.viewId
         });
         break;
 
@@ -769,10 +771,30 @@ async function exportTableData(tableId, maxRows, filterColumns, opts = {}) {
   const table = tableData.table || tableData;
   const tableName = table.name || tableId;
 
-  // Get default view ID for record fetching
-  const viewId = table.firstViewId || (table.views && table.views[0]?.id);
+  // View ID resolution. Order of preference:
+  //   1. Explicit `opts.viewId` from caller — use it verbatim. The caller has seen the Clay UI URL and knows which view to query.
+  //   2. table.firstViewId — Clay's metadata-marked "first" view; sometimes a filtered subset.
+  //   3. table.views[0].id — fallback to the first listed view.
+  // If multiple views exist and the caller didn't specify, log which one we chose + how many other
+  // views are available so callers can switch if the default misses rows visible in the UI.
+  let viewId = opts.viewId;
+  const availableViews = (table.views || []).map(v => ({ id: v.id, name: v.name || '(unnamed)' }));
   if (!viewId) {
-    throw new Error('No view found in table — cannot fetch records without a view ID');
+    viewId = table.firstViewId || (table.views && table.views[0]?.id);
+    if (!viewId) {
+      throw new Error('No view found in table — cannot fetch records without a view ID');
+    }
+    if (availableViews.length > 1) {
+      const otherViews = availableViews.filter(v => v.id !== viewId);
+      console.error(`[Bridge] No viewId specified — using default ${viewId}. ${otherViews.length} other view(s) available: ${otherViews.map(v => `${v.id} (${v.name})`).join(', ')}. Pass viewId explicitly if the default misses rows you expect.`);
+    }
+  } else {
+    // Validate caller-supplied viewId exists on the table — otherwise the records endpoint will 404
+    // with a misleading "view not found" message and the caller will think the bridge is broken.
+    if (availableViews.length && !availableViews.find(v => v.id === viewId)) {
+      throw new Error(`viewId "${viewId}" not found on table ${tableId}. Available views: ${availableViews.map(v => `${v.id} (${v.name})`).join(', ')}`);
+    }
+    console.error(`[Bridge] Using caller-supplied viewId ${viewId}`);
   }
 
   // Build field ID → column name map (skip system fields)
@@ -908,6 +930,8 @@ async function exportTableData(tableId, maxRows, filterColumns, opts = {}) {
     tableName,
     exportedAt: new Date().toISOString(),
     sort,
+    viewId,
+    availableViews,
     fetchedWindow: { startOffset, fetchedRowCount: allRows.length },
     rowCount: finalRows.length,
     columns: columnNames,
@@ -930,6 +954,8 @@ async function exportTableData(tableId, maxRows, filterColumns, opts = {}) {
     tableId,
     tableName,
     sort,
+    viewId,
+    availableViews,
     fetchedWindow: { startOffset, fetchedRowCount: allRows.length },
     rowCount: finalRows.length,
     columns: columnNames,
