@@ -805,7 +805,7 @@ async function exportTableData(tableId, maxRows, filterColumns, opts = {}) {
       const countResp = await clayRequest('GET', `/v3/tables/${tableId}/count`);
       const totalCount = (typeof countResp === 'number')
         ? countResp
-        : (countResp.count ?? countResp.rowCount ?? countResp.total ?? countResp.totalRecords ?? null);
+        : (countResp.tableTotalRecordsCount ?? countResp.count ?? countResp.rowCount ?? countResp.total ?? countResp.totalRecords ?? null);
       if (typeof totalCount === 'number' && Number.isFinite(totalCount)) {
         if (maxRows && maxRows < totalCount) {
           startOffset = totalCount - maxRows;
