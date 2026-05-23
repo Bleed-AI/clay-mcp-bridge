@@ -462,13 +462,24 @@ function getToolsList() {
     },
     {
       name: 'clay_export_table_data',
-      description: 'Export row data from a Clay table as JSON to a file. Always writes to /tmp and returns a summary with file path, sample rows, and column list. Use the Read tool to inspect the file. Supports column filtering to reduce output size.',
+      description: 'Export row data from a Clay table as JSON to a file. IMPORTANT: this pages through the table\'s default view (`/views/{viewId}/records`) which returns rows in the VIEW\'S native sort order — typically oldest-first. With sort="asc" + maxRows=N you get the OLDEST N rows; freshly-written rows will NOT appear unless you fetch the entire table OR use sort="desc" (which fetches count first, then pages the tail window). For write-verification (confirming a specific row landed), prefer `filterByColumnValue` which post-filters after pagination, OR sort="desc" with a maxRows ≥ the number of new rows you\'re looking for. Always writes full data to a JSON file and returns a summary with file path, sample rows, and column list.',
       inputSchema: {
         type: 'object',
         properties: {
           tableId: { type: 'string', description: 'The table ID (e.g., "t_abc123")' },
           maxRows: { type: 'number', description: 'Maximum number of rows to export. Default: all rows.' },
-          columns: { type: 'array', items: { type: 'string' }, description: 'Only include these columns (by name). Default: all columns.' }
+          columns: { type: 'array', items: { type: 'string' }, description: 'Only include these columns (by name). Default: all columns.' },
+          sort: { type: 'string', enum: ['asc', 'desc'], description: 'Row order. "asc" (default) pages from offset=0 — view\'s native order, typically oldest-first. "desc" calls clay_count_rows first then pages the LAST maxRows window — newest-first within the view; use this when verifying recently-written rows.' },
+          filterByColumnValue: {
+            type: 'object',
+            description: 'Post-filter rows after pagination: only keep rows where the named column starts with (or equals) the given value. Useful for write-verification (e.g. find rows whose Callback Id starts with "cb2c-"). Note this still pages the full window first — combine with sort="desc" + reasonable maxRows for efficient verification.',
+            properties: {
+              columnName: { type: 'string' },
+              value: { type: 'string', description: 'Substring/prefix to match (case-insensitive). Empty string matches all non-null values.' },
+              match: { type: 'string', enum: ['prefix', 'equals', 'contains'], description: 'Match mode. Default: "prefix".' }
+            },
+            required: ['columnName', 'value']
+          }
         },
         required: ['tableId']
       }
@@ -696,7 +707,10 @@ async function handleToolCall(request) {
 
       case 'clay_export_table_data':
         if (!args?.tableId) throw new Error('tableId is required');
-        result = await exportTableData(args.tableId, args.maxRows, args.columns);
+        result = await exportTableData(args.tableId, args.maxRows, args.columns, {
+          sort: args.sort,
+          filterByColumnValue: args.filterByColumnValue
+        });
         break;
 
       default:
@@ -736,10 +750,12 @@ async function handleToolCall(request) {
  * and sample rows so the LLM has context without burning tokens on full data.
  * Use Read tool on the file path to inspect specific portions.
  */
-async function exportTableData(tableId, maxRows, filterColumns) {
+async function exportTableData(tableId, maxRows, filterColumns, opts = {}) {
   const BATCH_SIZE = 100;
   const BATCH_DELAY = 150;
   const SAMPLE_ROWS = 3;
+  const sort = (opts.sort === 'desc') ? 'desc' : 'asc';
+  const filterByColumnValue = opts.filterByColumnValue || null;
 
   // 1. Fetch table schema for field mapping and table name
   console.error(`[Bridge] Exporting data from table ${tableId}...`);
@@ -778,13 +794,37 @@ async function exportTableData(tableId, maxRows, filterColumns) {
     throw new Error(`No matching columns found. Available: ${allColumnNames.join(', ')}`);
   }
 
-  // 2. Paginate through records using view-scoped endpoint
+  // 2. Paginate through records using view-scoped endpoint.
+  // The view returns rows in its native sort order (typically oldest-first by created_at).
+  // For sort="desc" we fetch the total row count first, then page the LAST maxRows window
+  // so the caller sees the most-recent rows (within the view's native order, then reversed).
+  let startOffset = 0;
+  let rowsToFetch = maxRows || Infinity;
+  if (sort === 'desc') {
+    try {
+      const countResp = await clayRequest('GET', `/v3/tables/${tableId}/count`);
+      const totalCount = (typeof countResp === 'number')
+        ? countResp
+        : (countResp.count ?? countResp.rowCount ?? countResp.total ?? countResp.totalRecords ?? null);
+      if (typeof totalCount === 'number' && Number.isFinite(totalCount)) {
+        if (maxRows && maxRows < totalCount) {
+          startOffset = totalCount - maxRows;
+        }
+        console.error(`[Bridge] sort=desc: total rows=${totalCount}, starting at offset=${startOffset}`);
+      } else {
+        console.error(`[Bridge] sort=desc: could not parse row count from response, falling back to offset=0 (results will be oldest-first)`);
+      }
+    } catch (e) {
+      console.error(`[Bridge] sort=desc: count call failed (${e.message}), falling back to offset=0`);
+    }
+  }
+
   const allRows = [];
-  let offset = 0;
+  let offset = startOffset;
   let hasMore = true;
 
   while (hasMore) {
-    const limit = maxRows ? Math.min(BATCH_SIZE, maxRows - allRows.length) : BATCH_SIZE;
+    const limit = maxRows ? Math.min(BATCH_SIZE, rowsToFetch - allRows.length) : BATCH_SIZE;
     if (limit <= 0) break;
 
     console.error(`[Bridge] Fetching records offset=${offset} limit=${limit} from view ${viewId}...`);
@@ -836,16 +876,42 @@ async function exportTableData(tableId, maxRows, filterColumns) {
     }
   }
 
-  console.error(`[Bridge] Exported ${allRows.length} rows from "${tableName}"`);
+  // Reverse for sort=desc so newest-first within the fetched window
+  if (sort === 'desc') {
+    allRows.reverse();
+  }
+
+  // Apply optional post-pagination value filter (case-insensitive)
+  let finalRows = allRows;
+  let filterNote = '';
+  if (filterByColumnValue && filterByColumnValue.columnName) {
+    const col = filterByColumnValue.columnName;
+    const needle = String(filterByColumnValue.value ?? '').toLowerCase();
+    const mode = filterByColumnValue.match || 'prefix';
+    const before = allRows.length;
+    finalRows = allRows.filter(r => {
+      const v = r[col];
+      if (v === null || v === undefined) return false;
+      const s = String(v).toLowerCase();
+      if (mode === 'equals') return s === needle;
+      if (mode === 'contains') return s.includes(needle);
+      return s.startsWith(needle); // prefix
+    });
+    filterNote = ` | filterByColumnValue ${col} ${mode} "${filterByColumnValue.value}": ${finalRows.length}/${before} matched`;
+  }
+
+  console.error(`[Bridge] Exported ${finalRows.length} rows from "${tableName}" (sort=${sort})${filterNote}`);
 
   // 4. Always write to file in exports/clay/ within the repo
   const output = {
     tableId,
     tableName,
     exportedAt: new Date().toISOString(),
-    rowCount: allRows.length,
+    sort,
+    fetchedWindow: { startOffset, fetchedRowCount: allRows.length },
+    rowCount: finalRows.length,
     columns: columnNames,
-    rows: allRows
+    rows: finalRows
   };
 
   const json = JSON.stringify(output, null, 2);
@@ -857,17 +923,19 @@ async function exportTableData(tableId, maxRows, filterColumns) {
   console.error(`[Bridge] Export (${(json.length / 1024).toFixed(1)}KB) written to ${filePath}`);
 
   // 5. Return compact summary with sample rows
-  const sampleRows = allRows.slice(0, SAMPLE_ROWS);
+  const sampleRows = finalRows.slice(0, SAMPLE_ROWS);
 
   return {
     filePath,
     tableId,
     tableName,
-    rowCount: allRows.length,
+    sort,
+    fetchedWindow: { startOffset, fetchedRowCount: allRows.length },
+    rowCount: finalRows.length,
     columns: columnNames,
     fileSizeKB: Math.round(json.length / 1024),
     sampleRows,
-    note: `Full data written to ${filePath}. Use Read tool to inspect. ${filterSet ? `Filtered to ${columnNames.length}/${allColumnNames.length} columns.` : ''}`
+    note: `Full data written to ${filePath}. Use Read tool to inspect. ${filterSet ? `Filtered to ${columnNames.length}/${allColumnNames.length} columns. ` : ''}${filterNote ? filterNote.replace(/^ \| /, '') + '. ' : ''}sort=${sort}${sort === 'asc' ? ' (oldest-first; recent rows may be beyond maxRows window — re-run with sort:"desc" to verify recent writes)' : ' (newest-first within fetched window)'}.`
   };
 }
 
